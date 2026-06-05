@@ -35,7 +35,7 @@ float[] starSize = new float[120];
 float[] starSpd  = new float[120];
 
 // Asteroids
-final int NAST = 7;
+final int NAST = 3;
 float[] astX       = new float[NAST];
 float[] astY       = new float[NAST];
 float[] astR       = new float[NAST];
