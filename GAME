@@ -1,0 +1,475 @@
+import ddf.minim.*;
+import ddf.minim.analysis.*;
+import ddf.minim.effects.*;
+
+// Audio
+Minim minim;
+AudioInput in;
+FFT fft;
+NotchFilter notch;
+BandPass alphaFilter;
+BandPass betaFilter;
+float scaleFreq = 1.33f;
+static int alphaCenter = 12;
+static int alphaBandwidth = 2;
+static int betaCenter = 24;
+static int betaBandwidth = 2;
+
+// Wave tracking
+float[] alphaAvg = new float[60];
+float[] betaAvg  = new float[60];
+int counter = 0;
+float finalAlpha = 0;
+float finalBeta  = 0;
+
+// Ship
+float shipY = 250;
+float shipVY = 0;
+float shipTilt = 0;
+final float shipX = 120;
+
+// Scrolling stars
+float[] starX    = new float[120];
+float[] starY    = new float[120];
+float[] starSize = new float[120];
+float[] starSpd  = new float[120];
+
+// Asteroids
+final int NAST = 7;
+float[] astX       = new float[NAST];
+float[] astY       = new float[NAST];
+float[] astR       = new float[NAST];
+float[] astSpd     = new float[NAST];
+float[] astRot     = new float[NAST];
+float[] astRotSpd  = new float[NAST];
+int[]   astVerts   = new int[NAST];
+float[][] astVX, astVY;
+
+// Orbs
+final int NORB = 3;
+float[] orbX      = new float[NORB];
+float[] orbY      = new float[NORB];
+boolean[] orbActive = new boolean[NORB];
+float orbPulse = 0;
+
+// Game state
+int score = 0;
+int lives = 3;
+boolean gameOver = false;
+boolean started  = false;
+float invincTimer = 0;
+float shakeX = 0, shakeY = 0, shakeTimer = 0;
+
+void setup() {
+  size(800, 500);
+
+  // Stars
+  for (int i = 0; i < 120; i++) {
+    starX[i]    = random(width);
+    starY[i]    = random(height);
+    starSize[i] = random(0.5, 2.5);
+    starSpd[i]  = random(0.5, 4);
+  }
+
+  // Asteroids
+  astVX = new float[NAST][12];
+  astVY = new float[NAST][12];
+  for (int i = 0; i < NAST; i++) spawnAsteroid(i, true);
+
+  // Orbs
+  for (int i = 0; i < NORB; i++) spawnOrb(i);
+
+  // Audio
+  minim = new Minim(this);
+  in    = minim.getLineIn(Minim.MONO, 2048, 44100, 16);
+  notch       = new NotchFilter(50, 10, 44100);   // 50 Hz — Thailand mains
+  alphaFilter = new BandPass(alphaCenter / scaleFreq, alphaBandwidth / scaleFreq, 44100);
+  betaFilter  = new BandPass(betaCenter  / scaleFreq, betaBandwidth  / scaleFreq, 44100);
+  in.addEffect(notch);
+  fft = new FFT(in.bufferSize(), in.sampleRate());
+  fft.window(FFT.HAMMING);
+}
+
+void draw() {
+  if (!started) { drawStartScreen(); return; }
+  if (gameOver)  { drawGameOver();   return; }
+
+  // Screen shake offset
+  float ox = 0, oy = 0;
+  if (shakeTimer > 0) {
+    ox = random(-shakeX, shakeX);
+    oy = random(-shakeY, shakeY);
+    shakeTimer--;
+    shakeX *= 0.88;
+    shakeY *= 0.88;
+  }
+  translate(ox, oy);
+
+  background(8, 8, 20);
+  drawNebulaGlow();
+
+  readWaves();
+  updateShip();
+
+  drawStars();
+  drawOrbs();
+  drawAsteroids();
+  drawShip();
+  drawWaveBars();
+  drawHUD();
+
+  updateAsteroids();
+  updateOrbs();
+  checkCollisions();
+
+  if (invincTimer > 0) invincTimer--;
+  orbPulse += 0.08;
+  score++;
+  counter++;
+}
+
+// ── Audio ─────────────────────────────────────────────
+void readWaves() {
+  fft.forward(in.left);
+
+  // Alpha band average
+  int aLow = round(fft.freqToIndex(alphaCenter - alphaBandwidth) / scaleFreq);
+  int aHi  = round(fft.freqToIndex(alphaCenter + alphaBandwidth) / scaleFreq);
+  float a = 0;
+  for (int j = aLow; j <= aHi; j++) a += fft.getBand(j);
+  a /= (aHi - aLow + 1);
+  a *= 0.5;
+  alphaAvg[counter % 60] = a;
+  float aSum = 0;
+  for (float v : alphaAvg) aSum += v;
+  finalAlpha = constrain(map(aSum / 60, 50, 200, 0, 1), 0, 1);
+
+  // Beta band average
+  int bLow = round(fft.freqToIndex(betaCenter - betaBandwidth) / scaleFreq);
+  int bHi  = round(fft.freqToIndex(betaCenter + betaBandwidth) / scaleFreq);
+  float b = 0;
+  for (int j = bLow; j <= bHi; j++) b += fft.getBand(j);
+  b /= (bHi - bLow + 1);
+  b *= 0.5;
+  betaAvg[counter % 60] = b;
+  float bSum = 0;
+  for (float v : betaAvg) bSum += v;
+  finalBeta = constrain(map(bSum / 60, 50, 200, 0, 1), 0, 1);
+}
+
+// ── Ship ──────────────────────────────────────────────
+void updateShip() {
+  float force = (finalBeta - finalAlpha) * 4.5;
+  shipVY = lerp(shipVY, force, 0.12);
+  shipY += shipVY;
+  shipY = constrain(shipY, 40, height - 40);
+  shipTilt = lerp(shipTilt, -shipVY * 5, 0.15);
+}
+
+void drawShip() {
+  boolean flash = (invincTimer > 0 && ((int)(invincTimer / 4) % 2 == 0));
+
+  pushMatrix();
+  translate(shipX, shipY);
+  rotate(radians(shipTilt));
+
+  // Engine glow
+  if (!flash) {
+    noStroke();
+    fill(80, 140, 255, 40);
+    ellipse(-28, 0, 36, 20);
+  }
+
+  // Thruster flame
+  noStroke();
+  fill(80, 160, 255, 180);
+  triangle(-20, -5, -20, 5, -38 + random(-4, 4), 0);
+  fill(200, 230, 255, 100);
+  triangle(-20, -3, -20, 3, -32 + random(-3, 3), 0);
+
+  // Main body
+  if (!flash) fill(180, 210, 255);
+  else        fill(255, 80, 80);
+  stroke(100, 160, 255);
+  strokeWeight(1.2);
+  beginShape();
+  vertex( 30,   0);
+  vertex(  0, -12);
+  vertex(-20, -10);
+  vertex(-22,   0);
+  vertex(-20,  10);
+  vertex(  0,  12);
+  endShape(CLOSE);
+
+  // Cockpit
+  noStroke();
+  fill(50, 180, 255, 200);
+  ellipse(10, -2, 18, 11);
+
+  // Top wing
+  fill(120, 170, 230);
+  stroke(80, 130, 200);
+  strokeWeight(1);
+  beginShape();
+  vertex(  5, -12);
+  vertex(-15, -28);
+  vertex(-22, -10);
+  endShape(CLOSE);
+
+  // Bottom wing
+  beginShape();
+  vertex(  5,  12);
+  vertex(-15,  28);
+  vertex(-22,  10);
+  endShape(CLOSE);
+
+  popMatrix();
+}
+
+// ── Stars ─────────────────────────────────────────────
+void drawStars() {
+  noStroke();
+  for (int i = 0; i < 120; i++) {
+    float a = map(starSpd[i], 0.5, 4, 60, 220);
+    fill(255, 255, 255, a);
+    ellipse(starX[i], starY[i], starSize[i] * 2, starSize[i] * 2);
+    starX[i] -= starSpd[i] * 0.6;
+    if (starX[i] < 0) { starX[i] = width + 2; starY[i] = random(height); }
+  }
+}
+
+// ── Nebula background glow ────────────────────────────
+void drawNebulaGlow() {
+  noStroke();
+  fill(15, 20, 60, 50);
+  ellipse(width * 0.65, height * 0.5, 560, 320);
+}
+
+// ── Asteroids ─────────────────────────────────────────
+void spawnAsteroid(int i, boolean offscreen) {
+  astX[i]       = offscreen ? random(width + 60, width + 400) : width + random(60, 200);
+  astY[i]       = random(30, height - 30);
+  astR[i]       = random(18, 55);
+  astSpd[i]     = random(1.5, 4);
+  astRot[i]     = random(TWO_PI);
+  astRotSpd[i]  = random(-0.025, 0.025);
+  astVerts[i]   = (int)random(7, 12);
+  for (int p = 0; p < astVerts[i]; p++) {
+    float ang = TWO_PI / astVerts[i] * p;
+    float rv  = astR[i] * random(0.72, 1.15);
+    astVX[i][p] = cos(ang) * rv;
+    astVY[i][p] = sin(ang) * rv;
+  }
+}
+
+void updateAsteroids() {
+  for (int i = 0; i < NAST; i++) {
+    astX[i]   -= astSpd[i];
+    astRot[i] += astRotSpd[i];
+    if (astX[i] < -80) spawnAsteroid(i, false);
+  }
+}
+
+void drawAsteroids() {
+  for (int i = 0; i < NAST; i++) {
+    pushMatrix();
+    translate(astX[i], astY[i]);
+    rotate(astRot[i]);
+
+    // Outer glow ring
+    noFill();
+    stroke(180, 130, 80, 30);
+    strokeWeight(astR[i] * 0.4);
+    ellipse(0, 0, astR[i] * 2 + 10, astR[i] * 2 + 10);
+
+    // Rocky body
+    fill(105, 78, 52);
+    stroke(160, 120, 70);
+    strokeWeight(1.2);
+    beginShape();
+    for (int p = 0; p < astVerts[i]; p++) vertex(astVX[i][p], astVY[i][p]);
+    endShape(CLOSE);
+
+    // Craters
+    noStroke();
+    fill(75, 55, 38);
+    ellipse( astR[i]*0.15, -astR[i]*0.10, astR[i]*0.36, astR[i]*0.36);
+    ellipse(-astR[i]*0.20,  astR[i]*0.15, astR[i]*0.24, astR[i]*0.24);
+
+    popMatrix();
+  }
+}
+
+// ── Orbs ──────────────────────────────────────────────
+void spawnOrb(int i) {
+  orbX[i]      = random(width + 60, width + 350);
+  orbY[i]      = random(60, height - 60);
+  orbActive[i] = true;
+}
+
+void updateOrbs() {
+  for (int i = 0; i < NORB; i++) {
+    if (!orbActive[i]) { spawnOrb(i); continue; }
+    orbX[i] -= 2.7;
+    if (orbX[i] < -20) spawnOrb(i);
+  }
+}
+
+void drawOrbs() {
+  for (int i = 0; i < NORB; i++) {
+    if (!orbActive[i]) continue;
+    float pulse = sin(orbPulse + i * 1.5) * 5;
+    float r = 13 + pulse;
+
+    // Outer glow
+    noFill();
+    stroke(80, 255, 180, 25);
+    strokeWeight(r * 0.65);
+    ellipse(orbX[i], orbY[i], r * 2 + 12, r * 2 + 12);
+
+    // Body
+    fill(80, 255, 180, 210);
+    stroke(160, 255, 220);
+    strokeWeight(1.2);
+    ellipse(orbX[i], orbY[i], r * 2, r * 2);
+
+    // Inner shine
+    noStroke();
+    fill(220, 255, 235, 200);
+    ellipse(orbX[i] - r * 0.28, orbY[i] - r * 0.28, r * 0.5, r * 0.5);
+  }
+}
+
+// ── Collisions ────────────────────────────────────────
+void checkCollisions() {
+  // Asteroids
+  if (invincTimer <= 0) {
+    for (int i = 0; i < NAST; i++) {
+      if (dist(shipX, shipY, astX[i], astY[i]) < astR[i] * 0.7 + 12) {
+        lives--;
+        invincTimer = 90;
+        shakeX = 14; shakeY = 10; shakeTimer = 20;
+        spawnAsteroid(i, false);
+        if (lives <= 0) gameOver = true;
+      }
+    }
+  }
+  // Energy orbs
+  for (int i = 0; i < NORB; i++) {
+    if (orbActive[i] && dist(shipX, shipY, orbX[i], orbY[i]) < 28) {
+      score += 500;
+      orbActive[i] = false;
+    }
+  }
+}
+
+// ── Wave bars (HUD) ───────────────────────────────────
+void drawWaveBars() {
+  float bH = 150;
+  float bY = height / 2 - bH / 2;
+
+  // Alpha bar
+  noFill(); stroke(60, 60, 100); strokeWeight(1);
+  rect(width - 38, bY, 12, bH, 3);
+  float aFill = bH * finalAlpha;
+  noStroke(); fill(100, 180, 255, 180);
+  rect(width - 38, bY + bH - aFill, 12, aFill, 3);
+  fill(100, 180, 255); textSize(10); textAlign(CENTER);
+  text("alpha", width - 32, bY - 8);
+
+  // Beta bar
+  noFill(); stroke(60, 60, 100); strokeWeight(1);
+  rect(width - 20, bY, 12, bH, 3);
+  float bFill = bH * finalBeta;
+  noStroke(); fill(255, 140, 80, 180);
+  rect(width - 20, bY + bH - bFill, 12, bFill, 3);
+  fill(255, 140, 80); textSize(10);
+  text("beta", width - 14, bY - 8);
+}
+
+// ── HUD ───────────────────────────────────────────────
+void drawHUD() {
+  // Score
+  textAlign(LEFT); fill(255); textSize(18);
+  text("SCORE  " + score, 20, 28);
+
+  // Lives (mini ship icons)
+  for (int i = 0; i < lives; i++) {
+    pushMatrix();
+    translate(22 + i * 22, 46);
+    fill(100, 180, 255); noStroke();
+    beginShape();
+    vertex( 8,  0); vertex(0, -5); vertex(-6, 0); vertex(0, 5);
+    endShape(CLOSE);
+    popMatrix();
+  }
+
+  // State label
+  textAlign(RIGHT); textSize(13);
+  if (finalAlpha > finalBeta + 0.15) {
+    fill(100, 180, 255);
+    text("CALM (up)", width - 50, 28);
+  } else if (finalBeta > finalAlpha + 0.15) {
+    fill(255, 140, 80);
+    text("FOCUS (down)", width - 50, 28);
+  } else {
+    fill(150, 150, 180);
+    text("NEUTRAL", width - 50, 28);
+  }
+
+  // Bottom hint
+  textAlign(CENTER); textSize(11); fill(60, 70, 110);
+  text("Relax (Alpha) = ship up   |   Focus (Beta) = ship down   |   Collect green orbs = +500", width / 2, height - 10);
+
+  textAlign(LEFT);
+}
+
+// ── Screens ───────────────────────────────────────────
+void drawStartScreen() {
+  background(8, 8, 20);
+  drawStars();
+  for (int i = 0; i < 120; i++) starX[i] -= starSpd[i] * 0.3;
+
+  textAlign(CENTER);
+  fill(180, 210, 255); textSize(46);
+  text("STAR PILOT", width / 2, height / 2 - 70);
+
+  fill(100, 180, 255); textSize(15);
+  text("Relax  (Alpha wave)  ->  ship goes UP", width / 2, height / 2 - 10);
+  text("Focus  (Beta wave)   ->  ship goes DOWN", width / 2, height / 2 + 16);
+  text("Collect green orbs   ->  +500 points", width / 2, height / 2 + 42);
+  text("Avoid asteroids      ->  lose a life", width / 2, height / 2 + 64);
+
+  fill(255, 220, 80); textSize(14);
+  text("Press SPACE to start", width / 2, height / 2 + 100);
+}
+
+void drawGameOver() {
+  background(8, 8, 20);
+  textAlign(CENTER);
+  fill(255, 80, 80); textSize(48);
+  text("GAME OVER", width / 2, height / 2 - 50);
+  fill(255); textSize(22);
+  text("Final Score: " + score, width / 2, height / 2 + 10);
+  fill(150); textSize(14);
+  text("Press R to restart", width / 2, height / 2 + 50);
+}
+
+// ── Input ─────────────────────────────────────────────
+void keyPressed() {
+  if (key == ' ' && !started) started = true;
+  if ((key == 'r' || key == 'R') && gameOver) {
+    score = 0; lives = 3; gameOver = false; started = true;
+    shipY = 250; shipVY = 0; invincTimer = 0;
+    for (int i = 0; i < NAST; i++) spawnAsteroid(i, true);
+    for (int i = 0; i < NORB; i++) spawnOrb(i);
+    for (int i = 0; i < 60; i++) { alphaAvg[i] = 0; betaAvg[i] = 0; }
+    counter = 0;
+  }
+}
+
+void stop() {
+  in.close();
+  minim.stop();
+  super.stop();
+}
